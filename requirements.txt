@@ -1,4 +1,5 @@
 polars
+pandas
 plotly
 great_tables
 requests
