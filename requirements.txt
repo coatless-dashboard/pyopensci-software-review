@@ -1,0 +1,4 @@
+polars
+plotly
+great_tables
+requests

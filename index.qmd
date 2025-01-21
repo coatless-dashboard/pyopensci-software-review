@@ -1,0 +1,691 @@
+---
+title: "pyOpenSci Software Review Dashboard"
+format: 
+    dashboard:
+        orientation: rows
+        theme: cosmo
+        scrolling: true
+        pages:
+          - id: overview
+            title: Overview
+            layout: [[1,1,1,1], # Top row with 4 value boxes
+                     [2,2,3,3], # Two charts below
+                     [4,4,4,4]] # Recent submissions table
+          - id: review-pipeline
+            title: Review Pipeline
+            layout: [[1], [2], [3]]
+          - id: timing-analysis
+            title: Review Timing
+            layout: [[1], [2]]
+          - id: metadata
+            title: Package Metadata
+            layout: [[1,2], [3,3]]
+---
+
+# Overview {#overview}
+
+```{python}
+#| output: false
+from great_tables import GT, md, google_font
+import plotly.graph_objects as go
+import plotly.express as px
+import polars as pl
+import requests
+import os
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+
+# GitHub GraphQL API configuration
+GITHUB_API = "https://api.github.com/graphql"
+headers = {
+    #"Authorization": "Bearer <token>",
+    "Content-Type": "application/json",
+}
+
+# Define constants for labels
+REVIEW_STAGES = [
+    "0/pre-review-checks",
+    "0/seeking-editor",
+    "1/editor-assigned",
+    "2/seeking-reviewers",
+    "3/reviewers-assigned",
+    "4/reviews-in-awaiting-changes",
+    "5/awaiting-reviewer-response",
+    "6/pyOS-approved",
+    "7/under-joss-review",
+    "8/joss-review-complete",
+    "9/joss-approved"
+]
+
+def fetch_issues():
+    """Fetch all issues from the pyOpenSci software-review repository using GraphQL"""
+
+    # Check for GitHub token in environment variables
+    github_token = os.environ.get('GITHUB_TOKEN')
+    
+    if github_token:
+        headers['Authorization'] = f'Bearer {github_token}'
+    else:
+        print("Warning: GitHub token not found. Rate limits may apply.")
+
+    query = """
+    query ($cursor: String) {
+        repository(owner: "pyOpenSci", name: "software-review") {
+            issues(first: 100, after: $cursor, orderBy: {field: CREATED_AT, direction: DESC}) {
+                pageInfo {
+                    hasNextPage
+                    endCursor
+                }
+                nodes {
+                    number
+                    title
+                    state
+                    createdAt
+                    closedAt
+                    comments {
+                        totalCount
+                    }
+                    labels(first: 100) {
+                        nodes {
+                            name
+                        }
+                    }
+                }
+            }
+        }
+    }
+    """
+    
+    all_issues = []
+    cursor = None
+    
+    while True:
+        try:
+            response = requests.post(
+                GITHUB_API,
+                json={"query": query, "variables": {"cursor": cursor}},
+                headers=headers
+            )
+            response.raise_for_status()
+            
+            data = response.json()
+            issues = data['data']['repository']['issues']
+            
+            all_issues.extend(issues['nodes'])
+            
+            if not issues['pageInfo']['hasNextPage']:
+                break
+                
+            cursor = issues['pageInfo']['endCursor']
+            
+        except Exception as e:
+            print(f"Error fetching issues: {e}")
+            break
+    
+    return all_issues
+
+def process_issues(issues: List[Dict]) -> pl.DataFrame:
+    """Process raw issue data into a Polars DataFrame"""
+    # Extract label names for each issue
+    processed_issues = []
+    for issue in issues:
+        labels = [label['name'] for label in issue['labels']['nodes']]
+        
+        issue_data = {
+            'number': issue['number'],
+            'title': issue['title'],
+            'state': issue['state'],
+            'created_at': issue['createdAt'],
+            'closed_at': issue['closedAt'],
+            'comments': issue['comments']['totalCount'],
+            'labels': labels,
+            'current_stage': next((stage for stage in REVIEW_STAGES if stage in labels), None),
+            'is_new_submission': 'New Submission!' in labels,
+            'is_presubmission': 'presubmission' in labels,
+            'is_review_underway': 'review-underway' in labels,
+            'is_incomplete': 'incomplete-closed-review' in labels,
+            'is_out_of_scope': 'currently-out-of-scope' in labels,
+            'is_archived': 'archived' in labels,
+            'needs_website': 'needs-website-content' in labels,
+            'is_duplicate': 'duplicate' in labels,
+            'is_astropy': 'astropy' in labels,
+            'is_pangeo': 'Pangeo' in labels
+        }
+        processed_issues.append(issue_data)
+    
+    # Convert to Polars DataFrame
+    df = pl.DataFrame(processed_issues)
+    
+    # Convert datetime columns
+    df = df.with_columns([
+        pl.col('created_at').str.strptime(pl.Datetime, format='%Y-%m-%dT%H:%M:%SZ', strict=False),
+        pl.col('closed_at').str.strptime(pl.Datetime, format='%Y-%m-%dT%H:%M:%SZ', strict=False)
+    ])
+    
+    return df
+
+# Fetch and process the data
+issues_data = fetch_issues()
+df = process_issues(issues_data)
+
+```
+
+## Row
+
+```{python}
+#| content: valuebox
+#| title: "Total Submissions"
+#| icon: file-earmark-text
+#| color: primary
+dict(
+    value = len(df)
+)
+```
+
+```{python}
+#| content: valuebox
+#| title: "Active Reviews"
+#| icon: hourglass-split
+#| color: info
+dict(
+    value = df.filter(pl.col('state') == 'OPEN').height
+)
+```
+
+```{python}
+#| content: valuebox
+#| title: "pyOS Approved"
+#| icon: check-circle
+#| color: success
+dict(
+    value = df.filter(pl.col('current_stage') == '6/pyOS-approved').height
+)
+```
+
+```{python}
+#| content: valuebox
+#| title: "JOSS Approved"
+#| icon: journal-check
+#| color: secondary
+dict(
+    value = df.filter(pl.col('current_stage') == '9/joss-approved').height
+)
+```
+
+## Row
+
+```{python}
+#| title: Monthly Submission Trends
+def create_monthly_trends():
+    # Group by month for submissions
+    monthly_submissions = (
+        df.group_by(pl.col('created_at').dt.truncate('1mo'))
+        .agg(pl.len().cast(pl.Int32).alias('count'))  
+        .sort('created_at')
+    )
+    
+    # Group by month for completions
+    monthly_completions = (
+        df.filter(pl.col('closed_at').is_not_null())
+        .group_by(pl.col('closed_at').dt.truncate('1mo'))
+        .agg(pl.len().cast(pl.Int32).alias('count')) 
+        .sort('closed_at')
+    )
+
+    fig = go.Figure()
+    
+    # Add submissions bars in blue (positive values)
+    fig.add_trace(go.Bar(
+        x=monthly_submissions['created_at'],
+        y=monthly_submissions['count'],
+        name="Submissions",
+        marker_color='rgb(75, 192, 75)',  # Green
+        text=monthly_submissions['count'],
+        textposition='auto',
+        hovertemplate='%{x|%B %Y}: %{y}<extra></extra>'
+    ))
+    
+    # Add completion bars in red (negative values)
+    fig.add_trace(go.Bar(
+        x=monthly_completions['closed_at'],
+        y=-monthly_completions['count'],  # Make values negative
+        name="Completions",
+        marker_color='rgb(255, 0, 0)',  # Red
+        text=monthly_completions['count'],  # Show positive values in labels
+        textposition='auto',
+        hovertemplate='%{x|%B %Y}: %{customdata}<extra></extra>',
+        customdata=monthly_completions['count']  # Use positive values for hover
+    ))
+
+    fig.update_layout(
+        title="Monthly Submission and Completion Trends",
+        xaxis_title="Month",
+        yaxis_title="Number of Packages",
+        height=300,
+        barmode='overlay',  # Overlay bars
+        bargap=0,          # No gap between bars
+        showlegend=True,
+        # Position legend horizontally below the graph
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-.5,
+            xanchor="center",
+            x=0.5
+        ),
+        # Add margin at bottom to make room for legend
+        margin=dict(b=50),
+        # Ensure y-axis is symmetrical around zero
+        yaxis=dict(
+            zeroline=True,
+            zerolinewidth=2,
+            zerolinecolor='black',
+        )
+    )
+    return fig
+
+create_monthly_trends()
+```
+
+## Row
+
+```{python}
+#| title: Current Stage Distribution
+def create_stage_distribution():
+    stage_counts = (
+        df.group_by('current_stage')
+        .agg(pl.count())
+        .filter(pl.col('current_stage').is_not_null())
+    )
+    
+    # Order stages according to REVIEW_STAGES
+    stages_ordered = [stage for stage in REVIEW_STAGES if stage in stage_counts['current_stage'].to_list()]
+    counts_ordered = [
+        stage_counts.filter(pl.col('current_stage') == stage)['count'].item() 
+        for stage in stages_ordered
+    ]
+
+    fig = go.Figure(data=[go.Bar(
+        x=stages_ordered,
+        y=counts_ordered,
+        text=counts_ordered,
+        textposition='auto',
+    )])
+
+    fig.update_layout(
+        title="Distribution Across Review Stages",
+        xaxis_title="Review Stage",
+        yaxis_title="Number of Packages",
+        xaxis={'tickangle': 45},
+        height=300
+    )
+    return fig
+
+create_stage_distribution()
+```
+
+## Row
+
+```{python}
+#| title: Recent Submissions
+recent_df = (
+    df.sort('created_at', descending=True)
+    .head(5)
+    .select(['number', 'title', 'current_stage', 'created_at'])
+)
+
+(GT(recent_df.to_pandas())
+    .tab_header(
+        title="Recent Package Submissions",
+        subtitle="Last 5 submissions to pyOpenSci"
+    )
+    .fmt_markdown(
+        columns=['title']
+    )
+    .fmt_date(
+        columns=['created_at'],
+        date_style="month_day_year"
+    )
+    .cols_label(
+        number="Issue #",
+        title="Package Name",
+        current_stage="Review Stage",
+        created_at="Submission Date"
+    )
+    .tab_source_note(
+        source_note="Data from pyOpenSci/software-review repository"
+    )
+    .opt_row_striping()
+    .opt_table_font(
+        font=google_font("Source Sans Pro")
+    )
+    .opt_stylize(style=1)
+)
+```
+
+# Review Pipeline {#review-pipeline}
+
+## Row
+
+```{python}
+#| title: Review Status
+def create_status_distribution():
+    status_data = {
+        'New Submissions': df.filter(pl.col('is_new_submission')).height,
+        'Presubmissions': df.filter(pl.col('is_presubmission')).height,
+        'Review Underway': df.filter(pl.col('is_review_underway')).height,
+        'Incomplete': df.filter(pl.col('is_incomplete')).height,
+        'Out of Scope': df.filter(pl.col('is_out_of_scope')).height,
+        'Archived': df.filter(pl.col('is_archived')).height,
+        'Needs Website': df.filter(pl.col('needs_website')).height,
+        'Duplicate': df.filter(pl.col('is_duplicate')).height
+    }
+
+    fig = go.Figure(data=[go.Bar(
+        x=list(status_data.keys()),
+        y=list(status_data.values()),
+        text=list(status_data.values()),
+        textposition='auto',
+    )])
+
+    fig.update_layout(
+        title="Review Status Distribution",
+        xaxis_title="Status",
+        yaxis_title="Count",
+        height=400
+    )
+    return fig
+
+create_status_distribution()
+```
+
+## Row
+
+```{python}
+#| title: Stage Progression Over Time
+def stage_progression():
+    # Group by month and stage, counting occurrences
+    monthly_stages = (
+        df.filter(pl.col('current_stage').is_not_null())
+        .with_columns([
+            pl.col('created_at').dt.truncate('1mo').alias('month')
+        ])
+        .group_by(['month', 'current_stage'])
+        .agg(pl.count())
+        .pivot(
+            values='count',
+            index='month',
+            columns='current_stage',
+            aggregate_function='sum'
+        )
+        .sort('month')
+        .fill_null(0)
+    )
+
+    fig = go.Figure()
+    
+    for stage in REVIEW_STAGES:
+        if stage in monthly_stages.columns:
+            fig.add_trace(go.Scatter(
+                x=monthly_stages['month'],
+                y=monthly_stages[stage],
+                name=stage,
+                stackgroup='one'
+            ))
+
+    fig.update_layout(
+        title="Monthly Review Stage Progression",
+        xaxis_title="Month",
+        yaxis_title="Number of Packages",
+        height=500
+    )
+    
+    return fig
+
+stage_progression()
+```
+
+## Row
+
+```{python}
+#| title: Stage Transition Timeline
+def create_transition_timeline():
+    # Calculate average time spent in each stage
+    transitions = (
+        df.filter(pl.col('current_stage').is_not_null())
+        .with_columns([
+            pl.col('closed_at').sub(pl.col('created_at'))
+            .dt.total_days()
+            .alias('days_to_completion')
+        ])
+        .group_by('current_stage')
+        .agg([
+            pl.mean('days_to_completion').alias('avg_days'),
+            pl.count().alias('count')
+        ])
+        .sort('current_stage')
+    )
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=transitions['current_stage'],
+        y=transitions['avg_days'],
+        text=transitions['avg_days'].round(1),
+        textposition='auto',
+        name='Average Days',
+        hovertemplate='Stage: %{x}<br>Avg Days: %{y:.1f}<br>Count: %{text}<extra></extra>',
+        customdata=transitions['count']
+    ))
+
+    fig.update_layout(
+        title="Average Time Spent in Each Stage",
+        xaxis_title="Stage",
+        yaxis_title="Average Days",
+        xaxis={'tickangle': 45},
+        height=400
+    )
+    
+    return fig
+
+create_transition_timeline()
+```
+
+# Review Timing {#timing-analysis}
+
+## Row
+
+```{python}
+#| title: Review Duration by Stage
+def reviews_by_stage():
+    # Calculate review duration for completed reviews
+    completed_reviews = (
+        df.filter(
+            (pl.col('state') == 'CLOSED') &
+            pl.col('closed_at').is_not_null() &
+            pl.col('current_stage').is_in(['6/pyOS-approved', '9/joss-approved'])
+        )
+        .with_columns([
+            pl.col('closed_at').sub(pl.col('created_at'))
+            .dt.total_days()
+            .alias('review_duration')
+        ])
+    )
+
+    fig = go.Figure()
+    
+    fig.add_trace(go.Box(
+        x=completed_reviews['current_stage'],
+        y=completed_reviews['review_duration'],
+        name="Review Duration",
+        boxpoints='all',  # Show all points
+        jitter=0.3,       # Add jitter to points
+        pointpos=0,       # Center points (0 = center, negative = left, positive = right)
+        marker=dict(
+            size=6,        # Make points smaller
+            opacity=0.6    # Add some transparency
+        )
+    ))
+
+    fig.update_layout(
+        title="Review Duration Distribution for Approved Packages",
+        xaxis_title="Approval Stage",
+        yaxis_title="Duration (days)",
+        height=400,
+        showlegend=False
+    )
+
+    return fig
+
+reviews_by_stage()
+```
+
+## Row
+
+```{python}
+#| title: Review Timeline Analysis
+def create_review_timeline():
+    # Calculate monthly average review duration
+    monthly_duration = (
+        df.filter(pl.col('closed_at').is_not_null())
+        .with_columns([
+            pl.col('closed_at').sub(pl.col('created_at'))
+            .dt.total_days()
+            .alias('duration'),
+            pl.col('created_at').dt.truncate('1mo').alias('month')
+        ])
+        .group_by('month')
+        .agg([
+            pl.mean('duration').alias('avg_duration'),
+            pl.count().alias('review_count')
+        ])
+        .sort('month')
+    )
+
+    fig = go.Figure()
+
+    # Add average duration line
+    fig.add_trace(go.Scatter(
+        x=monthly_duration['month'],
+        y=monthly_duration['avg_duration'],
+        name='Average Duration',
+        mode='lines+markers',
+        line=dict(color='blue')
+    ))
+
+    # Add review count bars
+    fig.add_trace(go.Bar(
+        x=monthly_duration['month'],
+        y=monthly_duration['review_count'],
+        name='Number of Reviews',
+        yaxis='y2',
+        opacity=0.3
+    ))
+
+    fig.update_layout(
+        title="Monthly Review Duration Trends",
+        xaxis_title="Month",
+        yaxis_title="Average Duration (days)",
+        yaxis2=dict(
+            title="Number of Reviews",
+            overlaying='y',
+            side='right'
+        ),
+        height=400,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+
+    return fig
+
+create_review_timeline()
+```
+
+# Package Metadata {#metadata}
+
+## Row
+
+```{python}
+#| title: Package Categories
+def create_categories_pie():
+    categories_data = {
+        'Astropy': df.filter(pl.col('is_astropy')).height,
+        'Pangeo': df.filter(pl.col('is_pangeo')).height,
+        'Other': df.filter(
+            ~pl.col('is_astropy') & ~pl.col('is_pangeo')
+        ).height
+    }
+
+    fig = go.Figure(data=[go.Pie(
+        labels=list(categories_data.keys()),
+        values=list(categories_data.values()),
+        hole=.3
+    )])
+
+    fig.update_layout(
+        title="Package Categories Distribution",
+        height=300
+    )
+    
+    return fig
+
+create_categories_pie()
+```
+
+## Row
+
+```{python}
+#| title: Categories Over Time
+def create_categories_timeline():
+    # Calculate monthly totals by category
+    monthly_categories = (
+        df.with_columns([
+            pl.col('created_at').dt.truncate('1mo').alias('month')
+        ])
+        .select([
+            'month',
+            pl.col('is_astropy').alias('Astropy'),
+            pl.col('is_pangeo').alias('Pangeo')
+        ])
+        .group_by('month')
+        .agg([
+            pl.col('Astropy').sum(),
+            pl.col('Pangeo').sum()
+        ])
+        .sort('month')
+    )
+
+    fig = go.Figure()
+
+    # Add lines for each category
+    for category in ['Astropy', 'Pangeo']:
+        fig.add_trace(go.Scatter(
+            x=monthly_categories['month'],
+            y=monthly_categories[category],
+            name=category,
+            mode='lines+markers'
+        ))
+
+    fig.update_layout(
+        title="Package Categories Over Time",
+        xaxis_title="Month",
+        yaxis_title="Number of Packages",
+        height=300,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+    
+    return fig
+
+create_categories_timeline()
+```

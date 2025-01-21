@@ -1,0 +1,66 @@
+on:
+    push:
+      branches: [main, master]
+    release:
+        types: [published]
+    workflow_dispatch: {}
+
+name: generate-website
+
+jobs:
+    demo-website:
+      runs-on: ubuntu-latest
+      # Only restrict concurrency for non-PR jobs
+      concurrency:
+        group: quarto-publish-${{ github.event_name != 'pull_request' || github.run_id }}
+      permissions:
+        contents: read
+        pages: write
+        id-token: write
+      steps:
+        - name: "Check out repository"
+          uses: actions/checkout@v4
+  
+        - name: "Setup pandoc"
+          uses: r-lib/actions/setup-pandoc@v2
+  
+              
+        # Download latest version of Python
+        - uses: actions/setup-python@v4
+          with:
+            python-version: '3.x' # Version range or exact version of a Python version to use, using SemVer's version range syntax
+            cache: 'pip'
+      
+        # Install python dependencies from requirements via pip
+        - name: "Install Python dependencies via Pip"
+          run: | 
+            pip install -r requirements.txt
+
+        # Quarto Setup
+        - name: "Set up Quarto"
+          uses: quarto-dev/quarto-actions/setup@v2
+          with:
+            version: "release"
+        
+        # Generate the dashboard website
+        - name: Render dashboard website
+          uses: quarto-dev/quarto-actions/render@v2
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        # Publish the docs directory onto gh-pages
+
+        # Upload a tar file that will work with GitHub Pages
+        # Make sure to set a retention day to avoid running into a cap
+        # This artifact shouldn't be required after deployment onto pages was a success.
+        - name: Upload Pages artifact
+          uses: actions/upload-pages-artifact@v2
+          with: 
+            retention-days: 1
+        
+        # Use an Action deploy to push the artifact onto GitHub Pages
+        # This requires the `Action` tab being structured to allow for deployment
+        # instead of using `docs/` or the `gh-pages` branch of the repository
+        - name: Deploy to GitHub Pages
+          id: deployment
+          uses: actions/deploy-pages@v2
