@@ -4,3 +4,4 @@ plotly
 great_tables
 requests
 jupyter
+pyarrow
