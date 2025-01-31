@@ -1,5 +1,6 @@
 ---
 title: "pyOpenSci Software Review Dashboard"
+author: '{{< modified "on %A, %B %d of %Y" >}}'
 format: 
     dashboard:
         orientation: rows
@@ -58,8 +59,7 @@ REVIEW_STAGES = [
 ]
 
 def fetch_issues():
-    """Fetch all issues from the pyOpenSci software-review repository using GraphQL"""
-
+    """Fetch all issues from the pyOpenSci software-submission repository using GraphQL"""
     # Check for GitHub token in environment variables
     github_token = os.environ.get('GITHUB_TOKEN')
     
@@ -70,7 +70,7 @@ def fetch_issues():
 
     query = """
     query ($cursor: String) {
-        repository(owner: "pyOpenSci", name: "software-review") {
+        repository(owner: "pyOpenSci", name: "software-submission") {
             issues(first: 100, after: $cursor, orderBy: {field: CREATED_AT, direction: DESC}) {
                 pageInfo {
                     hasNextPage
@@ -109,14 +109,24 @@ def fetch_issues():
             response.raise_for_status()
             
             data = response.json()
+            
+            # Check for errors in the response
+            if 'errors' in data:
+                print(f"GraphQL errors: {data['errors']}")
+                break
+                
             issues = data['data']['repository']['issues']
             
+            # Add the current page of issues
             all_issues.extend(issues['nodes'])
             
             if not issues['pageInfo']['hasNextPage']:
                 break
                 
             cursor = issues['pageInfo']['endCursor']
+            
+            # Add a small delay to avoid hitting rate limits
+            time.sleep(0.5)
             
         except Exception as e:
             print(f"Error fetching issues: {e}")
