@@ -33,6 +33,7 @@ import plotly.express as px
 import polars as pl
 import requests
 import os
+import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
@@ -62,7 +63,6 @@ def fetch_issues():
     """Fetch all issues from the pyOpenSci software-submission repository using GraphQL"""
     # Check for GitHub token in environment variables
     github_token = os.environ.get('GITHUB_TOKEN')
-    
     if github_token:
         headers['Authorization'] = f'Bearer {github_token}'
     else:
@@ -76,6 +76,7 @@ def fetch_issues():
                     hasNextPage
                     endCursor
                 }
+                totalCount
                 nodes {
                     number
                     title
@@ -95,7 +96,7 @@ def fetch_issues():
         }
     }
     """
-    
+
     all_issues = []
     cursor = None
     
@@ -120,6 +121,9 @@ def fetch_issues():
             # Add the current page of issues
             all_issues.extend(issues['nodes'])
             
+            # Print progress
+            print(f"Fetched {len(all_issues)} issues out of {issues['totalCount']}")
+            
             if not issues['pageInfo']['hasNextPage']:
                 break
                 
@@ -131,9 +135,9 @@ def fetch_issues():
         except Exception as e:
             print(f"Error fetching issues: {e}")
             break
-    
-    return all_issues
 
+    return all_issues
+    
 def process_issues(issues: List[Dict]) -> pl.DataFrame:
     """Process raw issue data into a Polars DataFrame"""
     # Extract label names for each issue
@@ -177,7 +181,6 @@ def process_issues(issues: List[Dict]) -> pl.DataFrame:
 # Fetch and process the data
 issues_data = fetch_issues()
 df = process_issues(issues_data)
-
 ```
 
 ## Row
