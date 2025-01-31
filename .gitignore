@@ -1,2 +1,6 @@
 *.html
 *_files
+*.env
+/.quarto/
+_site/
+/.luarc.json
